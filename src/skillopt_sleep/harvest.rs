@@ -35,7 +35,7 @@ pub fn detect_feedback(text: &str) -> Vec<String> {
     signals
 }
 
-/// Extract clean text from Claude message content (string or list of content blocks).
+/// Extract clean text from Claude / Onyx message content (string or list of content blocks).
 pub fn text_from_content(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -69,7 +69,7 @@ pub fn tool_names_from_content(content: &Value) -> Vec<String> {
     names
 }
 
-/// Parse Claude Code project transcript (.jsonl) into a normalized SessionDigest.
+/// Parse Claude Code or Onyx conversation transcripts (.jsonl) into a normalized SessionDigest.
 pub fn harvest_session_file<P: AsRef<Path>>(path: P) -> anyhow::Result<SessionDigest> {
     let file = File::open(path.as_ref())?;
     let reader = BufReader::new(file);
@@ -99,6 +99,22 @@ pub fn harvest_session_file<P: AsRef<Path>>(path: P) -> anyhow::Result<SessionDi
             Err(_) => continue,
         };
 
+        // Extract metadata if header record
+        let kind = record.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "meta" {
+            if let Some(c) = record.get("cwd").and_then(|v| v.as_str()) {
+                project = c.to_string();
+            }
+            if let Some(b) = record.get("branch").and_then(|v| v.as_str()) {
+                git_branch = b.to_string();
+            }
+            if let Some(s) = record.get("title").and_then(|v| v.as_str()) {
+                if session_id.is_empty() {
+                    session_id = s.to_string();
+                }
+            }
+        }
+
         if session_id.is_empty() {
             if let Some(sid) = record.get("sessionId").and_then(|v| v.as_str()) {
                 session_id = sid.to_string();
@@ -115,6 +131,34 @@ pub fn harvest_session_file<P: AsRef<Path>>(path: P) -> anyhow::Result<SessionDi
             }
         }
 
+        // Check for Onyx message records: {"kind": "message", "role": "...", "content": "..."}
+        if kind == "message" {
+            let role = record.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content_val = record.get("content").unwrap_or(&Value::Null);
+            let txt = text_from_content(content_val);
+
+            if let Some(tc) = record.get("tool_call") {
+                if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+                    tools_used.push(name.to_string());
+                }
+            }
+
+            if role == "user" {
+                n_user_turns += 1;
+                if !txt.is_empty() {
+                    feedback_signals.extend(detect_feedback(&txt));
+                    user_prompts.push(txt);
+                }
+            } else if role == "assistant" {
+                n_assistant_turns += 1;
+                if !txt.is_empty() {
+                    assistant_finals.push(txt);
+                }
+            }
+            continue;
+        }
+
+        // Claude Code message format: {"type": "...", "message": {"role": "...", "content": ...}}
         let rec_type = record.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(msg) = record.get("message") {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or(rec_type);
@@ -138,6 +182,14 @@ pub fn harvest_session_file<P: AsRef<Path>>(path: P) -> anyhow::Result<SessionDi
         }
     }
 
+    if session_id.is_empty() {
+        session_id = path
+            .as_ref()
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown_session".to_string());
+    }
+
     tools_used.sort();
     tools_used.dedup();
     feedback_signals.sort();
@@ -156,6 +208,29 @@ pub fn harvest_session_file<P: AsRef<Path>>(path: P) -> anyhow::Result<SessionDi
         raw_path: path.as_ref().to_string_lossy().to_string(),
         ..Default::default()
     })
+}
+
+/// Harvest all Onyx sessions from a directory (e.g. `~/.onyx/sessions`).
+pub fn harvest_onyx_sessions<P: AsRef<Path>>(dir: P) -> anyhow::Result<Vec<SessionDigest>> {
+    let mut digests = Vec::new();
+    if !dir.as_ref().exists() {
+        return Ok(digests);
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Ok(digest) = harvest_session_file(&p) {
+                if digest.n_user_turns > 0 {
+                    digests.push(digest);
+                }
+            }
+        }
+    }
+
+    digests.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(digests)
 }
 
 #[cfg(test)]
@@ -184,5 +259,27 @@ mod tests {
         ]);
         assert_eq!(text_from_content(&content), "Analyzing repo...\nDone.");
         assert_eq!(tool_names_from_content(&content), vec!["Bash"]);
+    }
+
+    #[test]
+    fn test_onyx_session_harvest() {
+        let onyx_jsonl = r#"{"kind":"meta","model":"gpt-oss-120b-medium","title":"Hi","ts":1793814844,"cwd":"/root","branch":"main"}
+{"content":"create a next.js app","kind":"message","role":"user","ts":1793815293}
+{"content":"Done","kind":"message","role":"assistant","tool_call":{"args":{"cmd":"echo"},"name":"bash"},"ts":1793815293}
+{"content":"Still broken, fix it","kind":"message","role":"user","ts":1793815300}
+"#;
+        let tmp_file = std::env::temp_dir().join("test_onyx_session.jsonl");
+        std::fs::write(&tmp_file, onyx_jsonl).unwrap();
+
+        let digest = harvest_session_file(&tmp_file).unwrap();
+        assert_eq!(digest.project, "/root");
+        assert_eq!(digest.git_branch, "main");
+        assert_eq!(digest.n_user_turns, 2);
+        assert_eq!(digest.n_assistant_turns, 1);
+        assert!(digest.tools_used.contains(&"bash".to_string()));
+        assert!(digest.feedback_signals.contains(&"neg:still broken".to_string()));
+        assert!(digest.feedback_signals.contains(&"neg:fix it".to_string()));
+
+        let _ = std::fs::remove_file(&tmp_file);
     }
 }
