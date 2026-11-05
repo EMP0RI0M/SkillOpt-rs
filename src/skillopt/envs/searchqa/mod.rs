@@ -1,3 +1,1 @@
-fn main() {
-    "SearchQA environment package for ReflACT.";
-}
+pub mod evaluator;
