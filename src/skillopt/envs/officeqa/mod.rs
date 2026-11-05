@@ -1,3 +1,1 @@
-fn main() {
-    "OfficeQA environment package for ReflACT.";
-}
+pub mod evaluator;
