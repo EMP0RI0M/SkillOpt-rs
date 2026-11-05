@@ -1,3 +1,1 @@
-fn main() {
-    "DocVQA environment package for ReflACT.";
-}
+pub mod evaluator;
